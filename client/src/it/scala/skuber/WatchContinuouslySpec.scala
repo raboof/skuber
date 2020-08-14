@@ -1,21 +1,63 @@
 package skuber
 
-import akka.stream.KillSwitches
-import akka.stream.scaladsl.{Keep, Sink}
+import akka.NotUsed
+import akka.stream.{KillSwitches, UniqueKillSwitch}
+import akka.stream.scaladsl.SinkQueueWithCancel
+import akka.stream.scaladsl.{Keep, Sink, Source}
 import org.scalatest.Matchers
 import org.scalatest.concurrent.{Eventually, ScalaFutures}
 import org.scalatest.time.{Seconds, Span}
+import skuber.api.client.WatchEvent
 import skuber.apps.v1.{Deployment, DeploymentList}
 
 import scala.concurrent.duration._
-import scala.concurrent.Await
-
+import scala.concurrent.{Await, Promise}
 import scala.language.postfixOps
 
 class WatchContinuouslySpec extends K8SFixture with Eventually with Matchers with ScalaFutures {
   implicit val defaultPatience: PatienceConfig = PatienceConfig(timeout = Span(200, Seconds), interval = Span(5, Seconds))
 
   behavior of "WatchContinuously"
+
+  it should "not leak Akka HTTP connection pools when restarted" in { k8s =>
+    import skuber.api.client.EventType
+
+    var currentSwitch: Promise[UniqueKillSwitch] = Promise()
+
+    def watch(): Source[WatchEvent[Deployment], NotUsed] = {
+      k8s.watchWithOptions[Deployment](ListOptions())
+        .mapMaterializedValue(_ => NotUsed)
+        .viaMat(KillSwitches.single)(Keep.right)
+        .mapMaterializedValue(ks => {
+          currentSwitch.success(ks)
+          NotUsed
+        })
+        .recoverWithRetries(-1, { case t => {
+          system.log.warning(s"Retrying... due to $t")
+          currentSwitch = Promise()
+          watch()
+        }})
+    }
+
+    system.log.warning("Watching...")
+    val q: SinkQueueWithCancel[WatchEvent[Deployment]] = watch()
+        .runWith(Sink.queue[WatchEvent[Deployment]]())
+    system.log.warning("Pulling...")
+    q.pull.futureValue
+    system.log.warning("Aborting...")
+    currentSwitch.future.futureValue.abort(new IllegalStateException())
+    system.log.warning("Pulling...")
+    q.pull.futureValue
+    currentSwitch.future.futureValue.abort(new IllegalStateException())
+    q.pull.futureValue
+    currentSwitch.future.futureValue.abort(new IllegalStateException())
+    q.pull.futureValue
+    currentSwitch.future.futureValue.abort(new IllegalStateException())
+    q.pull.futureValue
+    system.log.warning("Sleeping")
+    Thread.sleep(10000)
+    1 should be(1)
+  }
 
   it should "continuously watch changes on a resource - deployments" in { k8s =>
     import skuber.api.client.EventType
